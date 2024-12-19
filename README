@@ -17,9 +17,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 WHAT IS MOD_EVASIVE ?
 
 mod_evasive is an evasive maneuvers module for Apache to provide evasive
-action in the event of an HTTP DoS or DDoS attack or brute force attack.  It 
-is also designed to be a detection tool, and can be easily configured to talk 
-to ipchains, firewalls, routers, and etcetera.  
+action in the event of an HTTP DoS or DDoS attack or brute force attack.
 
 Detection is performed by creating an internal dynamic hash table of IP 
 Addresses and URIs, and denying any single IP address from any of the following:
@@ -56,9 +54,7 @@ A web hit request comes in. The following steps take place:
   second (from the same child).
 
 If any of the above are true, a 403 response is sent.  This conserves
-bandwidth and system resources in the event of a DoS attack.  Additionally,
-a system command and/or an email notification can also be triggered to block
-all the originating addresses of a DDoS attack. 
+bandwidth and system resources in the event of a DoS attack.
 
 Once a single 403 incident occurs, mod_evasive now blocks the entire IP 
 address for a period of 10 seconds (configurable).  If the host requests a 
@@ -66,20 +62,10 @@ page within this period, it is forced to wait even longer.  Since this is
 triggered from requesting the same URL multiple times per second, this 
 again does not affect legitimate users.
 
-The blacklist can/should be configured to talk to your network's firewalls 
-and/or routers to push the attack out to the front lines, but this is not 
-required.
-
-mod_evasive also performs syslog reporting using daemon.alert.  Messages
-will look like this:
-
-Aug  6 17:41:49 elijah mod_evasive[23184]: [ID 801097 daemon.alert] Blacklisting address x.x.x.x: possible attack.
-
 WHAT IS THIS TOOL USEFUL FOR?
 
 This tool is *excellent* at fending off request-based DoS attacks or scripted
-attacks, and brute force attacks. When integrated with firewalls or IP filters,
-mod_evasive can stand up to even large attacks. Its features will prevent you 
+attacks, and brute force attacks. Its features will prevent you
 from wasting bandwidth or having a few thousand CGI scripts running as a 
 result of an attack.  
 
@@ -112,12 +98,6 @@ following block to your httpd.conf:
     DOSSiteInterval     1
     DOSBlockingPeriod   10
 </IfModule>
-
-Optionally you can also add the following directives:
-
-    DOSEmailNotify	you@yourdomain.com
-    DOSSystemCommand	"su - someuser -c '/sbin/... %s ...'"
-    DOSLogDir		"/var/lock/mod_evasive"
 
 You will also need to add this line if you are building with dynamic support:
 
@@ -171,42 +151,6 @@ the timer being reset (e.g. another 10 seconds).  Since the timer is reset
 for every subsequent request, it is not necessary to have a long blocking
 period; in the event of a DoS attack, this timer will keep getting reset. 
 
-DOSEmailNotify
---------------
-
-If this value is set, an email will be sent to the address specified
-whenever an IP address becomes blacklisted.  A locking mechanism using /tmp
-prevents continuous emails from being sent.
-
-NOTE: Be sure MAILER is set correctly in mod_evasive.c 
-      (or mod_evasive20.c).  The default is "/bin/mail -t %s" where %s is 
-      used to denote the destination email address set in the configuration.  
-      If you are running on linux or some other operating system with a 
-      different type of mailer, you'll need to change this.
-
-DOSSystemCommand
-----------------
-
-If this value is set, the system command specified will be executed
-whenever an IP address becomes blacklisted.  This is designed to enable
-system calls to ip filter or other tools.  A locking mechanism using /tmp
-prevents continuous system calls.  Use %s to denote the IP address of the
-blacklisted IP.
-
-DOSLogDir
----------
-
-Choose an alternative temp directory
-
-By default "/tmp" will be used for locking mechanism, which opens some 
-security issues if your system is open to shell users.
-
-  	http://security.lss.hr/index.php?page=details&ID=LSS-2005-01-01
-
-In the event you have nonprivileged shell users, you'll want to create a
-directory writable only to the user Apache is running as (usually root),
-then set this in your httpd.conf.
-
 WHITELISTING IP ADDRESSES
 
 IP addresses of trusted clients can be whitelisted to insure they are never 
@@ -242,9 +186,7 @@ will prevent cleanup.
 You'll want to have a MaxRequestsPerChild set to a non-zero value, as
 DosEvasive cleans up its internal hashes only on exit.  The default
 MaxRequestsPerChild is usually 10000.  This should suffice in only allowing
-a few requests per 10000 per child through in the event of an attack (although
-if you use DOSSystemCommand to firewall the IP address, a hole will no
-longer be open in between child cycles).
+a few requests per 10000 per child through in the event of an attack.
 
 TESTING
 

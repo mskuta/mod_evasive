@@ -29,7 +29,6 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <stdlib.h>
 #include <sys/types.h>
 #include <time.h>
-#include <syslog.h>
 #include <errno.h>
 
 #include "httpd.h"
@@ -42,16 +41,12 @@ module AP_MODULE_DECLARE_DATA evasive20_module;
 
 /* BEGIN DoS Evasive Maneuvers Definitions */
 
-#define MAILER	"/bin/mail %s"
-#define  LOG( A, ... ) { openlog("mod_evasive", LOG_PID, LOG_DAEMON); syslog( A, __VA_ARGS__ ); closelog(); }
-
 #define DEFAULT_HASH_TBL_SIZE   3097ul  // Default hash table size
 #define DEFAULT_PAGE_COUNT      2       // Default maximum page hit count per interval
 #define DEFAULT_SITE_COUNT      50      // Default maximum site hit count per interval
 #define DEFAULT_PAGE_INTERVAL   1       // Default 1 Second page interval
 #define DEFAULT_SITE_INTERVAL   1       // Default 1 Second site interval
 #define DEFAULT_BLOCKING_PERIOD 10      // Default for Detected IPs; blocked for 10 seconds
-#define DEFAULT_LOG_DIR		"/tmp"  // Default temp directory
 
 /* END DoS Evasive Maneuvers Definitions */
 
@@ -102,9 +97,6 @@ static int page_interval = DEFAULT_PAGE_INTERVAL;
 static int site_count = DEFAULT_SITE_COUNT;
 static int site_interval = DEFAULT_SITE_INTERVAL;
 static int blocking_period = DEFAULT_BLOCKING_PERIOD;
-static char *email_notify = NULL;
-static char *log_dir = NULL;
-static char *system_command = NULL;
 static const char *whitelist(cmd_parms *cmd, void *dconfig, const char *ip);
 int is_whitelisted(const char *ip);
 
@@ -199,44 +191,6 @@ static int access_checker(request_rec *r)
         }
       }
 
-      /* Perform email notification and system functions */
-      if (ret == HTTP_FORBIDDEN) {
-        char filename[1024];
-        struct stat s;
-        FILE *file;
-
-        snprintf(filename, sizeof(filename), "%s/dos-%s", log_dir != NULL ? log_dir : DEFAULT_LOG_DIR, r->connection->remote_ip);
-        if (stat(filename, &s)) {
-          file = fopen(filename, "w");
-          if (file != NULL) {
-            fprintf(file, "%ld\n", getpid());
-            fclose(file);
-
-            LOG(LOG_ALERT, "Blacklisting address %s: possible DoS attack.", r->connection->remote_ip);
-            if (email_notify != NULL) {
-              snprintf(filename, sizeof(filename), MAILER, email_notify);
-              file = popen(filename, "w");
-              if (file != NULL) {
-                fprintf(file, "To: %s\n", email_notify);
-                fprintf(file, "Subject: HTTP BLACKLIST %s\n\n", r->connection->remote_ip);
-                fprintf(file, "mod_evasive HTTP Blacklisted %s\n", r->connection->remote_ip);
-                pclose(file);
-              }
-            }
-
-            if (system_command != NULL) {
-              snprintf(filename, sizeof(filename), system_command, r->connection->remote_ip);
-              system(filename);
-            }
- 
-          } else {
-            LOG(LOG_ALERT, "Couldn't open logfile %s: %s",filename, strerror(errno));
-	  }
-
-        } /* if (temp file does not exist) */
-
-      } /* if (ret == HTTP_FORBIDDEN) */
-
     } /* if (r->prev == NULL && r->main == NULL && hit_list != NULL) */
 
     /* END DoS Evasive Maneuvers Code */
@@ -296,8 +250,6 @@ int is_whitelisted(const char *ip) {
 
 static apr_status_t destroy_hit_list(void *not_used) {
   ntt_destroy(hit_list);
-  free(email_notify);
-  free(system_command);
 }
 
 
@@ -611,39 +563,6 @@ get_blocking_period(cmd_parms *cmd, void *dconfig, const char *value) {
   return NULL;
 }
 
-static const char *
-get_log_dir(cmd_parms *cmd, void *dconfig, const char *value) {
-  if (value != NULL && value[0] != 0) {
-    if (log_dir != NULL)
-      free(log_dir);
-    log_dir = strdup(value);
-  }
-
-  return NULL;
-}
-
-static const char *
-get_email_notify(cmd_parms *cmd, void *dconfig, const char *value) {
-  if (value != NULL && value[0] != 0) {
-    if (email_notify != NULL)
-      free(email_notify);
-    email_notify = strdup(value);
-  }
-
-  return NULL;
-}
-
-static const char *
-get_system_command(cmd_parms *cmd, void *dconfig, const char *value) {
-  if (value != NULL && value[0] != 0) {
-    if (system_command != NULL)
-      free(system_command);
-    system_command = strdup(value);
-  }
- 
-  return NULL;
-} 
-
 /* END Configuration Functions */
 
 static const command_rec access_cmds[] =
@@ -665,15 +584,6 @@ static const command_rec access_cmds[] =
 
         AP_INIT_TAKE1("DOSBlockingPeriod", get_blocking_period, NULL, RSRC_CONF,
 		"Set blocking period for detected DoS IPs"),
-
-	AP_INIT_TAKE1("DOSEmailNotify", get_email_notify, NULL, RSRC_CONF,
-		"Set email notification"),
-
-	AP_INIT_TAKE1("DOSLogDir", get_log_dir, NULL, RSRC_CONF,
-		"Set log dir"),
-
-	AP_INIT_TAKE1("DOSSystemCommand", get_system_command, NULL, RSRC_CONF,
-		"Set system command on DoS"),
 
         AP_INIT_ITERATE("DOSWhitelist", whitelist, NULL, RSRC_CONF,
                 "IP-addresses wildcards to whitelist"),
