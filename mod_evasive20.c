@@ -105,11 +105,11 @@ static int access_checker(request_rec* r) {
 		time_t t = time(NULL);
 
 		/* Check whitelist */
-		if (is_whitelisted(r->connection->remote_ip))
+		if (is_whitelisted(r->useragent_ip))
 			return OK;
 
 		/* First see if the IP itself is on "hold" */
-		n = ntt_find(hit_list, r->connection->remote_ip);
+		n = ntt_find(hit_list, r->useragent_ip);
 
 		if (n != NULL && t - n->timestamp < blocking_period) {
 
@@ -122,14 +122,14 @@ static int access_checker(request_rec* r) {
 		else {
 
 			/* Has URI been hit too much? */
-			snprintf(hash_key, 2048, "%s_%s", r->connection->remote_ip, r->uri);
+			snprintf(hash_key, 2048, "%s_%s", r->useragent_ip, r->uri);
 			n = ntt_find(hit_list, hash_key);
 			if (n != NULL) {
 
 				/* If URI is being hit too much, add to "hold" list and 403 */
 				if (t - n->timestamp < page_interval && n->count >= page_count) {
 					ret = HTTP_FORBIDDEN;
-					ntt_insert(hit_list, r->connection->remote_ip, time(NULL));
+					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
 
@@ -146,14 +146,14 @@ static int access_checker(request_rec* r) {
 			}
 
 			/* Has site been hit too much? */
-			snprintf(hash_key, 2048, "%s_SITE", r->connection->remote_ip);
+			snprintf(hash_key, 2048, "%s_SITE", r->useragent_ip);
 			n = ntt_find(hit_list, hash_key);
 			if (n != NULL) {
 
 				/* If site is being hit too much, add to "hold" list and 403 */
 				if (t - n->timestamp < site_interval && n->count >= site_count) {
 					ret = HTTP_FORBIDDEN;
-					ntt_insert(hit_list, r->connection->remote_ip, time(NULL));
+					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
 
