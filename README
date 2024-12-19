@@ -53,10 +53,10 @@ A web hit request comes in. The following steps take place:
   if the same host has requested more than 50 objects within the past
   second (from the same child).
 
-If any of the above are true, a 403 response is sent.  This conserves
+If any of the above are true, a 429 response is sent.  This conserves
 bandwidth and system resources in the event of a DoS attack.
 
-Once a single 403 incident occurs, mod_evasive now blocks the entire IP 
+Once a single 429 incident occurs, mod_evasive now blocks the entire IP
 address for a period of 10 seconds (configurable).  If the host requests a 
 page within this period, it is forced to wait even longer.  Since this is 
 triggered from requesting the same URL multiple times per second, this 
@@ -71,7 +71,7 @@ result of an attack.
 
 If you do not have an infrastructure capable of fending off any other types
 of DoS attacks, chances are this tool will only help you to the point of
-your total bandwidth or server capacity for sending 403's.  Without a solid
+your total bandwidth or server capacity for sending 429's.  Without a solid
 infrastructure and address filtering tool in place, a heavy distributed DoS 
 will most likely still take you offline.  
 
@@ -146,7 +146,7 @@ DOSBlockingPeriod
 
 The blocking period is the amount of time (in seconds) that a client will be
 blocked for if they are added to the blocking list.  During this time, all
-subsequent requests from the client will result in a 403 (Forbidden) and
+subsequent requests from the client will result in a 429 (Too Many Requests) and
 the timer being reset (e.g. another 10 seconds).  Since the timer is reset
 for every subsequent request, it is not necessary to have a long blocking
 period; in the event of a DoS attack, this timer will keep getting reset. 
@@ -179,7 +179,7 @@ keep each child up long enough to resist a DOS attack (or at least part of
 one).  Remember, it is the child processes that maintain their own internal
 IP address tables, and so when one exits, so does all of the IP information it
 had. For every child that exits, another 5-10 copies of the page may get 
-through before putting the attacker back into '403 Land'.  With this said, 
+through before putting the attacker back into '429 Land'.  With this said,
 you should have a very high MaxRequestsPerChild, but not unlimited as this
 will prevent cleanup.
 
@@ -192,7 +192,7 @@ TESTING
 
 Want to make sure it's working? Run test.pl, and view the response codes.
 It's best to run it several times on the same machine as the web server until
-you get 403 Forbidden messages. Some larger servers with high child counts 
+you get 429 (Too Many Requests) messages. Some larger servers with high child counts
 may require more of a beating than smaller servers before blacklisting
 addresses. 
 

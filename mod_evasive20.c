@@ -113,8 +113,8 @@ static int access_checker(request_rec* r) {
 
 		if (n != NULL && t - n->timestamp < blocking_period) {
 
-			/* If the IP is on "hold", make it wait longer in 403 land */
-			ret = HTTP_FORBIDDEN;
+			/* If the IP is on "hold", make it wait longer in 429 land */
+			ret = HTTP_TOO_MANY_REQUESTS;
 			n->timestamp = time(NULL);
 
 			/* Not on hold, check hit stats */
@@ -126,9 +126,9 @@ static int access_checker(request_rec* r) {
 			n = ntt_find(hit_list, hash_key);
 			if (n != NULL) {
 
-				/* If URI is being hit too much, add to "hold" list and 403 */
+				/* If URI is being hit too much, add to "hold" list and 429 */
 				if (t - n->timestamp < page_interval && n->count >= page_count) {
-					ret = HTTP_FORBIDDEN;
+					ret = HTTP_TOO_MANY_REQUESTS;
 					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
@@ -150,9 +150,9 @@ static int access_checker(request_rec* r) {
 			n = ntt_find(hit_list, hash_key);
 			if (n != NULL) {
 
-				/* If site is being hit too much, add to "hold" list and 403 */
+				/* If site is being hit too much, add to "hold" list and 429 */
 				if (t - n->timestamp < site_interval && n->count >= site_count) {
-					ret = HTTP_FORBIDDEN;
+					ret = HTTP_TOO_MANY_REQUESTS;
 					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
@@ -172,7 +172,7 @@ static int access_checker(request_rec* r) {
 
 	} /* if (r->prev == NULL && r->main == NULL && hit_list != NULL) */
 
-	if (ret == HTTP_FORBIDDEN && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
+	if (ret == HTTP_TOO_MANY_REQUESTS && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
 		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "client denied by server configuration: %s", r->filename);
 	}
 
