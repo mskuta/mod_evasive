@@ -530,7 +530,7 @@ static void register_hooks(apr_pool_t* p) {
 	config.page_interval = DEFAULT_PAGE_INTERVAL;
 	config.site_interval = DEFAULT_SITE_INTERVAL;
 	config.blocking_period = DEFAULT_BLOCKING_PERIOD;
-	ap_hook_access_checker(access_checker, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_access_checker(access_checker, NULL, NULL, APR_HOOK_FIRST);
 	apr_pool_cleanup_register(p, NULL, apr_pool_cleanup_null, destroy_hit_list);
 };
 
