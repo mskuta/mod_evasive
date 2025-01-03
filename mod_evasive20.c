@@ -32,7 +32,18 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 module AP_MODULE_DECLARE_DATA evasive20_module;
 
-#define DEFAULT_HASH_TBL_SIZE   3097ul  // Default hash table size
+typedef struct {
+	unsigned long hash_table_size;
+	int page_count;
+	int page_interval;
+	int site_count;
+	int site_interval;
+	int blocking_period;
+} evasive20_config;
+
+static evasive20_config config;
+
+#define DEFAULT_HASH_TABLE_SIZE 3097ul  // Default hash table size
 #define DEFAULT_PAGE_COUNT      2       // Default maximum page hit count per interval
 #define DEFAULT_SITE_COUNT      50      // Default maximum site hit count per interval
 #define DEFAULT_PAGE_INTERVAL   1       // Default 1 Second page interval
@@ -73,27 +84,12 @@ struct ntt_node* c_ntt_next(struct ntt* ntt, struct ntt_c* c);
 
 struct ntt* hit_list;  // Our dynamic hash table
 
-static unsigned long hash_table_size = DEFAULT_HASH_TBL_SIZE;
-static int page_count = DEFAULT_PAGE_COUNT;
-static int page_interval = DEFAULT_PAGE_INTERVAL;
-static int site_count = DEFAULT_SITE_COUNT;
-static int site_interval = DEFAULT_SITE_INTERVAL;
-static int blocking_period = DEFAULT_BLOCKING_PERIOD;
-static const char* whitelist(cmd_parms* cmd, void* dconfig, const char* ip);
 int is_whitelisted(const char* ip);
 
 static void* create_hit_list(apr_pool_t* p, server_rec* s) {
 	/* Create a new hit list for this listener */
 
-	hit_list = ntt_create(hash_table_size);
-}
-
-static const char* whitelist(cmd_parms* cmd, void* dconfig, const char* ip) {
-	char entry[128];
-	snprintf(entry, sizeof(entry), "WHITELIST_%s", ip);
-	ntt_insert(hit_list, entry, time(NULL));
-
-	return NULL;
+	hit_list = ntt_create(config.hash_table_size);
 }
 
 static int access_checker(request_rec* r) {
@@ -111,7 +107,7 @@ static int access_checker(request_rec* r) {
 		/* First see if the IP itself is on "hold" */
 		n = ntt_find(hit_list, r->useragent_ip);
 
-		if (n != NULL && t - n->timestamp < blocking_period) {
+		if (n != NULL && t - n->timestamp < config.blocking_period) {
 
 			/* If the IP is on "hold", make it wait longer in 429 land */
 			ret = HTTP_TOO_MANY_REQUESTS;
@@ -127,14 +123,14 @@ static int access_checker(request_rec* r) {
 			if (n != NULL) {
 
 				/* If URI is being hit too much, add to "hold" list and 429 */
-				if (t - n->timestamp < page_interval && n->count >= page_count) {
+				if (t - n->timestamp < config.page_interval && n->count >= config.page_count) {
 					ret = HTTP_TOO_MANY_REQUESTS;
 					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
 
 					/* Reset our hit count list as necessary */
-					if (t - n->timestamp >= page_interval) {
+					if (t - n->timestamp >= config.page_interval) {
 						n->count = 0;
 					}
 				}
@@ -151,14 +147,14 @@ static int access_checker(request_rec* r) {
 			if (n != NULL) {
 
 				/* If site is being hit too much, add to "hold" list and 429 */
-				if (t - n->timestamp < site_interval && n->count >= site_count) {
+				if (t - n->timestamp < config.site_interval && n->count >= config.site_count) {
 					ret = HTTP_TOO_MANY_REQUESTS;
 					ntt_insert(hit_list, r->useragent_ip, time(NULL));
 				}
 				else {
 
 					/* Reset our hit count list as necessary */
-					if (t - n->timestamp >= site_interval) {
+					if (t - n->timestamp >= config.site_interval) {
 						n->count = 0;
 					}
 				}
@@ -465,93 +461,75 @@ struct ntt_node* c_ntt_next(struct ntt* ntt, struct ntt_c* c) {
 	return ((struct ntt_node*)NULL);
 }
 
-static const char* get_hash_tbl_size(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-
-	if (n <= 0) {
-		hash_table_size = DEFAULT_HASH_TBL_SIZE;
-	}
-	else {
-		hash_table_size = n;
-	}
-
+static const char* set_hash_table_size(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.hash_table_size = n;
 	return NULL;
 }
 
-static const char* get_page_count(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-	if (n <= 0) {
-		page_count = DEFAULT_PAGE_COUNT;
-	}
-	else {
-		page_count = n;
-	}
-
+static const char* set_page_count(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.page_count = n;
 	return NULL;
 }
 
-static const char* get_site_count(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-	if (n <= 0) {
-		site_count = DEFAULT_SITE_COUNT;
-	}
-	else {
-		site_count = n;
-	}
-
+static const char* set_site_count(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.site_count = n;
 	return NULL;
 }
 
-static const char* get_page_interval(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-	if (n <= 0) {
-		page_interval = DEFAULT_PAGE_INTERVAL;
-	}
-	else {
-		page_interval = n;
-	}
-
+static const char* set_page_interval(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.page_interval = n;
 	return NULL;
 }
 
-static const char* get_site_interval(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-	if (n <= 0) {
-		site_interval = DEFAULT_SITE_INTERVAL;
-	}
-	else {
-		site_interval = n;
-	}
-
+static const char* set_site_interval(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.site_interval = n;
 	return NULL;
 }
 
-static const char* get_blocking_period(cmd_parms* cmd, void* dconfig, const char* value) {
-	long n = strtol(value, NULL, 0);
-	if (n <= 0) {
-		blocking_period = DEFAULT_BLOCKING_PERIOD;
-	}
-	else {
-		blocking_period = n;
-	}
+static const char* set_blocking_period(cmd_parms* cmd, void* dconfig, const char* value) {
+	const long n = strtol(value, NULL, 0);
+	if (n > 0)
+		config.blocking_period = n;
+	return NULL;
+}
 
+static const char* set_whitelist(cmd_parms* cmd, void* dconfig, const char* value) {
+	char entry[128];
+	snprintf(entry, sizeof entry, "WHITELIST_%s", value);
+	ntt_insert(hit_list, entry, time(NULL));
 	return NULL;
 }
 
 // clang-format off
-static const command_rec access_cmds[] = {
-	AP_INIT_TAKE1("DOSHashTableSize", get_hash_tbl_size, NULL, RSRC_CONF, "Set size of hash table"),
-	AP_INIT_TAKE1("DOSPageCount", get_page_count, NULL, RSRC_CONF, "Set maximum page hit count per interval"),
-	AP_INIT_TAKE1("DOSSiteCount", get_site_count, NULL, RSRC_CONF, "Set maximum site hit count per interval"),
-	AP_INIT_TAKE1("DOSPageInterval", get_page_interval, NULL, RSRC_CONF, "Set page interval"),
-	AP_INIT_TAKE1("DOSSiteInterval", get_site_interval, NULL, RSRC_CONF, "Set site interval"),
-	AP_INIT_TAKE1("DOSBlockingPeriod", get_blocking_period, NULL, RSRC_CONF, "Set blocking period for detected DoS IPs"),
-	AP_INIT_ITERATE("DOSWhitelist", whitelist, NULL, RSRC_CONF, "IP-addresses wildcards to whitelist"),
+static const command_rec evasive20_cmds[] = {
+	AP_INIT_TAKE1("DOSHashTableSize", set_hash_table_size, NULL, RSRC_CONF, "Set size of hash table"),
+	AP_INIT_TAKE1("DOSPageCount", set_page_count, NULL, RSRC_CONF, "Set maximum page hit count per interval"),
+	AP_INIT_TAKE1("DOSSiteCount", set_site_count, NULL, RSRC_CONF, "Set maximum site hit count per interval"),
+	AP_INIT_TAKE1("DOSPageInterval", set_page_interval, NULL, RSRC_CONF, "Set page interval in seconds"),
+	AP_INIT_TAKE1("DOSSiteInterval", set_site_interval, NULL, RSRC_CONF, "Set site interval in seconds"),
+	AP_INIT_TAKE1("DOSBlockingPeriod", set_blocking_period, NULL, RSRC_CONF, "Set blocking period in seconds for detected IPs"),
+	AP_INIT_ITERATE("DOSWhitelist", set_whitelist, NULL, RSRC_CONF, "Set IPs to be ignored, also as wildcards"),
 	{ NULL }
 };
 // clang-format on
 
 static void register_hooks(apr_pool_t* p) {
+	config.hash_table_size = DEFAULT_HASH_TABLE_SIZE;
+	config.page_count = DEFAULT_PAGE_COUNT;
+	config.site_count = DEFAULT_SITE_COUNT;
+	config.page_interval = DEFAULT_PAGE_INTERVAL;
+	config.site_interval = DEFAULT_SITE_INTERVAL;
+	config.blocking_period = DEFAULT_BLOCKING_PERIOD;
 	ap_hook_access_checker(access_checker, NULL, NULL, APR_HOOK_MIDDLE);
 	apr_pool_cleanup_register(p, NULL, apr_pool_cleanup_null, destroy_hit_list);
 };
@@ -563,7 +541,7 @@ module AP_MODULE_DECLARE_DATA evasive20_module = {
 	NULL,
 	create_hit_list,
 	NULL,
-	access_cmds,
+	evasive20_cmds,
 	register_hooks
 };
 // clang-format on
