@@ -20,526 +20,502 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
 
-#include <time.h>
+#include <stdbool.h>
 
 // clang-format off
+#include "ap_socache.h"
+#include "apr_cstr.h"
+#include "apr_strings.h"
 #include "httpd.h"
 #include "http_config.h"
 #include "http_core.h"
 #include "http_log.h"
 #include "http_request.h"
+#include "util_mutex.h"
 // clang-format on
+
+#define MUTEXTYPE_BLOCK   "evasive20-block"
+#define MUTEXTYPE_PAGE    "evasive20-page"
+#define MUTEXTYPE_SITE    "evasive20-site"
+
+#define WHITELIST_NUM_MAX 10
+#define WHITELIST_IP_SIZE 40
 
 module AP_MODULE_DECLARE_DATA evasive20_module;
-
+static char errorstr[MAX_STRING_LEN];
 typedef struct {
-	unsigned long hash_table_size;
-	int page_count;
-	int page_interval;
-	int site_count;
-	int site_interval;
-	int blocking_period;
+	int on;
+	unsigned int page_count;
+	unsigned int site_count;
+	apr_interval_time_t blocking_period;
+	apr_interval_time_t page_interval;
+	apr_interval_time_t site_interval;
+	apr_global_mutex_t* cache_mutex_block;
+	apr_global_mutex_t* cache_mutex_page;
+	apr_global_mutex_t* cache_mutex_site;
+	ap_socache_instance_t* cache_instance_block;
+	ap_socache_instance_t* cache_instance_page;
+	ap_socache_instance_t* cache_instance_site;
+	ap_socache_provider_t* cache_provider;
+	unsigned whitelist_num;
+	char whitelist_ip[WHITELIST_NUM_MAX][WHITELIST_IP_SIZE];
 } evasive20_config;
 
-static evasive20_config config;
-
-#define DEFAULT_HASH_TABLE_SIZE 3097ul  // Default hash table size
-#define DEFAULT_PAGE_COUNT      2       // Default maximum page hit count per interval
-#define DEFAULT_SITE_COUNT      50      // Default maximum site hit count per interval
-#define DEFAULT_PAGE_INTERVAL   1       // Default 1 Second page interval
-#define DEFAULT_SITE_INTERVAL   1       // Default 1 Second site interval
-#define DEFAULT_BLOCKING_PERIOD 10      // Default for Detected IPs; blocked for 10 seconds
-
-enum { ntt_num_primes = 28 };
-
-/* ntt root tree */
-struct ntt {
-	long size;
-	long items;
-	struct ntt_node** tbl;
-};
-
-/* ntt node (entry in the ntt root tree) */
-struct ntt_node {
-	char* key;
-	time_t timestamp;
-	long count;
-	struct ntt_node* next;
-};
-
-/* ntt cursor */
-struct ntt_c {
-	long iter_index;
-	struct ntt_node* iter_next;
-};
-
-struct ntt* ntt_create(long size);
-int ntt_destroy(struct ntt* ntt);
-struct ntt_node* ntt_find(struct ntt* ntt, const char* key);
-struct ntt_node* ntt_insert(struct ntt* ntt, const char* key, time_t timestamp);
-int ntt_delete(struct ntt* ntt, const char* key);
-long ntt_hashcode(struct ntt* ntt, const char* key);
-struct ntt_node* c_ntt_first(struct ntt* ntt, struct ntt_c* c);
-struct ntt_node* c_ntt_next(struct ntt* ntt, struct ntt_c* c);
-
-struct ntt* hit_list;  // Our dynamic hash table
-
-int is_whitelisted(const char* ip);
-
-static void* create_hit_list(apr_pool_t* p, server_rec* s) {
-	/* Create a new hit list for this listener */
-
-	hit_list = ntt_create(config.hash_table_size);
+static void unlock_mutex(apr_global_mutex_t* mutex, request_rec* r) {
+	const apr_status_t status = apr_global_mutex_unlock(mutex);
+	if (status != APR_SUCCESS)
+		ap_log_rerror(APLOG_MARK, APLOG_ERR, status, r, "failed to release lock on mutex: %s", apr_strerror(status, errorstr, sizeof errorstr));
 }
 
-static int access_checker(request_rec* r) {
-	int ret = OK;
+static bool is_mutex_locked(apr_global_mutex_t* mutex, request_rec* r) {
+	const apr_status_t status = apr_global_mutex_trylock(mutex);
+	if (status != APR_SUCCESS) {
+		ap_log_rerror(APLOG_MARK, status == APR_EBUSY ? APLOG_NOTICE : APLOG_WARNING, status, r, "failed to acquire lock on mutex: %s", apr_strerror(status, errorstr, sizeof errorstr));
+		return false;
+	}
+	return true;
+}
 
-	if (r->prev == NULL && r->main == NULL && hit_list != NULL) {
-		char hash_key[2048];
-		struct ntt_node* n;
-		time_t t = time(NULL);
+static int evasive20_access_checker(request_rec* r) {
+	// ignore sub-requests
+	if (r->main)
+		return DECLINED;
 
-		/* Check whitelist */
-		if (is_whitelisted(r->useragent_ip))
-			return OK;
+	const evasive20_config* const config = (evasive20_config*)ap_get_module_config(r->server->module_config, &evasive20_module);
+	if (!config->on)
+		return DECLINED;
 
-		/* First see if the IP itself is on "hold" */
-		n = ntt_find(hit_list, r->useragent_ip);
-
-		if (n != NULL && t - n->timestamp < config.blocking_period) {
-
-			/* If the IP is on "hold", make it wait longer in 429 land */
-			ret = HTTP_TOO_MANY_REQUESTS;
-			n->timestamp = time(NULL);
-
-			/* Not on hold, check hit stats */
+	// cancel here if this IP is to be ignored
+	for (unsigned i = 0; i < config->whitelist_num; i++)
+		if (ap_strcmp_match(r->useragent_ip, config->whitelist_ip[i]) == 0) {
+			ap_log_rerror(APLOG_MARK, APLOG_INFO, APR_SUCCESS, r, "IP is whitelisted: %s", r->useragent_ip);
+			return DECLINED;
 		}
-		else {
 
-			/* Has URI been hit too much? */
-			snprintf(hash_key, 2048, "%s_%s", r->useragent_ip, r->uri);
-			n = ntt_find(hit_list, hash_key);
-			if (n != NULL) {
+	// IPs cannot be tracked without caches
+	if (!(config->cache_instance_block && config->cache_instance_page && config->cache_instance_site)) {
+		ap_log_rerror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, r, "some cache was not instantiated");
+		return DECLINED;
+	}
 
-				/* If URI is being hit too much, add to "hold" list and 429 */
-				if (t - n->timestamp < config.page_interval && n->count >= config.page_count) {
-					ret = HTTP_TOO_MANY_REQUESTS;
-					ntt_insert(hit_list, r->useragent_ip, time(NULL));
-				}
-				else {
+	const apr_time_t blocking_time = r->request_time + config->blocking_period;
+	bool is_blocked = false;
+	struct {
+		unsigned int count;
+	} data;
+	unsigned int datalen;
+	apr_status_t status;
+	datalen = sizeof data;
+	status = config->cache_provider->retrieve(config->cache_instance_block, r->server, r->useragent_ip, strlen(r->useragent_ip), (unsigned char*)&data, &datalen, r->pool);
+	if (status == APR_SUCCESS) {
+		is_blocked = true;
 
-					/* Reset our hit count list as necessary */
-					if (t - n->timestamp >= config.page_interval) {
-						n->count = 0;
+		// continue to block IP
+		if (is_mutex_locked(config->cache_mutex_block, r)) {
+			datalen = sizeof data;
+			status = config->cache_provider->store(config->cache_instance_block, r->server, r->useragent_ip, strlen(r->useragent_ip), blocking_time, (unsigned char*)&data, datalen, r->pool);
+			if (status == APR_SUCCESS)
+				ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, "blocking period extended for IP: %s", r->useragent_ip);
+			else
+				ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to extend blocking period for IP: %s", r->useragent_ip);
+			unlock_mutex(config->cache_mutex_block, r);
+		}
+	}
+	else if (status == APR_NOTFOUND) {
+		unsigned char id[2048];
+
+		// check whether the page has been hit too often
+		snprintf(id, sizeof id, "%s_%s_%s", r->useragent_ip, r->server->server_hostname, r->parsed_uri.path ? r->parsed_uri.path : "/");
+		datalen = sizeof data;
+		status = config->cache_provider->retrieve(config->cache_instance_page, r->server, id, strlen(id), (unsigned char*)&data, &datalen, r->pool);
+		if (status == APR_SUCCESS) {
+			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "page entry found for id: %s (count: %d)", id, data.count);
+			data.count++;
+			if (data.count > config->page_count) {
+				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "page limit exceeded for id: %s", id);
+
+				// begin to block IP
+				if (is_mutex_locked(config->cache_mutex_block, r)) {
+					datalen = sizeof data;
+					status = config->cache_provider->store(config->cache_instance_block, r->server, r->useragent_ip, strlen(r->useragent_ip), blocking_time, (unsigned char*)&data, datalen, r->pool);
+					if (status == APR_SUCCESS) {
+						ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, "blocking period started for IP: %s", r->useragent_ip);
+						is_blocked = true;
 					}
+					else
+						ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to start blocking period for IP: %s", r->useragent_ip);
+					unlock_mutex(config->cache_mutex_block, r);
 				}
-				n->timestamp = t;
-				n->count++;
 			}
 			else {
-				ntt_insert(hit_list, hash_key, t);
+				if (is_mutex_locked(config->cache_mutex_page, r)) {
+					datalen = sizeof data;
+					status = config->cache_provider->store(config->cache_instance_page, r->server, id, strlen(id), r->request_time + config->page_interval, (unsigned char*)&data, datalen, r->pool);
+					if (status == APR_SUCCESS)
+						ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "page entry updated for id: %s", id);
+					else
+						ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to update page entry for id: %s", id);
+					unlock_mutex(config->cache_mutex_page, r);
+				}
 			}
+		}
+		else if (status == APR_NOTFOUND) {
+			data.count = 1;
+			if (is_mutex_locked(config->cache_mutex_page, r)) {
+				datalen = sizeof data;
+				status = config->cache_provider->store(config->cache_instance_page, r->server, id, strlen(id), r->request_time + config->page_interval, (unsigned char*)&data, datalen, r->pool);
+				if (status == APR_SUCCESS)
+					ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "page entry inserted for id: %s", id);
+				else
+					ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to insert page entry for id: %s", id);
+				unlock_mutex(config->cache_mutex_page, r);
+			}
+		}
+		else
+			ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to retrieve page entry for id: %s", id);
 
-			/* Has site been hit too much? */
-			snprintf(hash_key, 2048, "%s_SITE", r->useragent_ip);
-			n = ntt_find(hit_list, hash_key);
-			if (n != NULL) {
+		// check whether the site has been hit too often
+		snprintf(id, sizeof id, "%s_%s", r->useragent_ip, r->server->server_hostname);
+		datalen = sizeof data;
+		status = config->cache_provider->retrieve(config->cache_instance_site, r->server, id, strlen(id), (unsigned char*)&data, &datalen, r->pool);
+		if (status == APR_SUCCESS) {
+			ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "site entry found for id: %s (count: %d)", id, data.count);
+			data.count++;
+			if (data.count > config->site_count) {
+				ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "site limit exceeded for id: %s", id);
 
-				/* If site is being hit too much, add to "hold" list and 429 */
-				if (t - n->timestamp < config.site_interval && n->count >= config.site_count) {
-					ret = HTTP_TOO_MANY_REQUESTS;
-					ntt_insert(hit_list, r->useragent_ip, time(NULL));
-				}
-				else {
-
-					/* Reset our hit count list as necessary */
-					if (t - n->timestamp >= config.site_interval) {
-						n->count = 0;
+				// begin to block IP
+				if (is_mutex_locked(config->cache_mutex_block, r)) {
+					datalen = sizeof data;
+					status = config->cache_provider->store(config->cache_instance_block, r->server, r->useragent_ip, strlen(r->useragent_ip), blocking_time, (unsigned char*)&data, datalen, r->pool);
+					if (status == APR_SUCCESS) {
+						ap_log_rerror(APLOG_MARK, APLOG_INFO, status, r, "blocking period started for IP: %s", r->useragent_ip);
+						is_blocked = true;
 					}
+					else
+						ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to start blocking period for IP: %s", r->useragent_ip);
+					unlock_mutex(config->cache_mutex_block, r);
 				}
-				n->timestamp = t;
-				n->count++;
 			}
 			else {
-				ntt_insert(hit_list, hash_key, t);
+				if (is_mutex_locked(config->cache_mutex_site, r)) {
+					datalen = sizeof data;
+					status = config->cache_provider->store(config->cache_instance_site, r->server, id, strlen(id), r->request_time + config->site_interval, (unsigned char*)&data, datalen, r->pool);
+					if (status == APR_SUCCESS)
+						ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "site entry updated for id: %s", id);
+					else
+						ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to update site entry for id: %s", id);
+					unlock_mutex(config->cache_mutex_site, r);
+				}
 			}
 		}
-
-	} /* if (r->prev == NULL && r->main == NULL && hit_list != NULL) */
-
-	if (ret == HTTP_TOO_MANY_REQUESTS && (ap_satisfies(r) != SATISFY_ANY || !ap_some_auth_required(r))) {
-		ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r, "client denied by server configuration: %s", r->filename);
-	}
-
-	return ret;
-}
-
-int is_whitelisted(const char* ip) {
-	char hashkey[128];
-	char octet[4][4];
-	char* dip;
-	char* oct;
-	int i = 0;
-
-	memset(octet, 0, 16);
-	dip = strdup(ip);
-	if (dip == NULL)
-		return 0;
-
-	oct = strtok(dip, ".");
-	while (oct != NULL && i < 4) {
-		if (strlen(oct) <= 3)
-			strcpy(octet[i], oct);
-		i++;
-		oct = strtok(NULL, ".");
-	}
-	free(dip);
-
-	/* Exact Match */
-	snprintf(hashkey, sizeof(hashkey), "WHITELIST_%s", ip);
-	if (ntt_find(hit_list, hashkey) != NULL)
-		return 1;
-
-	/* IPv4 Wildcards */
-	snprintf(hashkey, sizeof(hashkey), "WHITELIST_%s.*.*.*", octet[0]);
-	if (ntt_find(hit_list, hashkey) != NULL)
-		return 1;
-
-	snprintf(hashkey, sizeof(hashkey), "WHITELIST_%s.%s.*.*", octet[0], octet[1]);
-	if (ntt_find(hit_list, hashkey) != NULL)
-		return 1;
-
-	snprintf(hashkey, sizeof(hashkey), "WHITELIST_%s.%s.%s.*", octet[0], octet[1], octet[2]);
-	if (ntt_find(hit_list, hashkey) != NULL)
-		return 1;
-
-	/* No match */
-	return 0;
-}
-
-static apr_status_t destroy_hit_list(void* not_used) {
-	ntt_destroy(hit_list);
-}
-
-// clang-format off
-static unsigned long ntt_prime_list[ntt_num_primes] = {
-	53ul,         97ul,         193ul,       389ul,       769ul,
-	1543ul,       3079ul,       6151ul,      12289ul,     24593ul,
-	49157ul,      98317ul,      196613ul,    393241ul,    786433ul,
-	1572869ul,    3145739ul,    6291469ul,   12582917ul,  25165843ul,
-	50331653ul,   100663319ul,  201326611ul, 402653189ul, 805306457ul,
-	1610612741ul, 3221225473ul, 4294967291ul
-};
-// clang-format on
-
-/* Find the numeric position in the hash table based on key and modulus */
-
-long ntt_hashcode(struct ntt* ntt, const char* key) {
-	unsigned long val = 0;
-	for (; *key; ++key)
-		val = 5 * val + *key;
-	return (val % ntt->size);
-}
-
-/* Creates a single node in the tree */
-
-struct ntt_node* ntt_node_create(const char* key) {
-	char* node_key;
-	struct ntt_node* node;
-
-	node = (struct ntt_node*)malloc(sizeof(struct ntt_node));
-	if (node == NULL) {
-		return NULL;
-	}
-	if ((node_key = strdup(key)) == NULL) {
-		free(node);
-		return NULL;
-	}
-	node->key = node_key;
-	node->timestamp = time(NULL);
-	node->next = NULL;
-	return (node);
-}
-
-/* Tree initializer */
-
-struct ntt* ntt_create(long size) {
-	long i = 0;
-	struct ntt* ntt = (struct ntt*)malloc(sizeof(struct ntt));
-
-	if (ntt == NULL)
-		return NULL;
-	while (ntt_prime_list[i] < size) {
-		i++;
-	}
-	ntt->size = ntt_prime_list[i];
-	ntt->items = 0;
-	ntt->tbl = (struct ntt_node**)calloc(ntt->size, sizeof(struct ntt_node*));
-	if (ntt->tbl == NULL) {
-		free(ntt);
-		return NULL;
-	}
-	return (ntt);
-}
-
-/* Find an object in the tree */
-
-struct ntt_node* ntt_find(struct ntt* ntt, const char* key) {
-	long hash_code;
-	struct ntt_node* node;
-
-	if (ntt == NULL)
-		return NULL;
-
-	hash_code = ntt_hashcode(ntt, key);
-	node = ntt->tbl[hash_code];
-
-	while (node) {
-		if (!strcmp(key, node->key)) {
-			return (node);
+		else if (status == APR_NOTFOUND) {
+			data.count = 1;
+			datalen = sizeof data;
+			if (is_mutex_locked(config->cache_mutex_site, r)) {
+				status = config->cache_provider->store(config->cache_instance_site, r->server, id, strlen(id), r->request_time + config->site_interval, (unsigned char*)&data, datalen, r->pool);
+				if (status == APR_SUCCESS)
+					ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, "site entry inserted for id: %s", id);
+				else
+					ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to insert site entry for id: %s", id);
+				unlock_mutex(config->cache_mutex_site, r);
+			}
 		}
-		node = node->next;
+		else
+			ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to retrieve site entry for id: %s", id);
 	}
-	return ((struct ntt_node*)NULL);
+	else
+		ap_log_rerror(APLOG_MARK, APLOG_WARNING, status, r, "failed to retrieve entry fo IP: %s", r->useragent_ip);
+
+	return is_blocked ? HTTP_TOO_MANY_REQUESTS : DECLINED;
 }
 
-/* Insert a node into the tree */
-
-struct ntt_node* ntt_insert(struct ntt* ntt, const char* key, time_t timestamp) {
-	long hash_code;
-	struct ntt_node* parent;
-	struct ntt_node* node;
-	struct ntt_node* new_node = NULL;
-
-	if (ntt == NULL)
-		return NULL;
-
-	hash_code = ntt_hashcode(ntt, key);
-	parent = NULL;
-	node = ntt->tbl[hash_code];
-
-	while (node != NULL) {
-		if (strcmp(key, node->key) == 0) {
-			new_node = node;
-			node = NULL;
-		}
-
-		if (new_node == NULL) {
-			parent = node;
-			node = node->next;
-		}
-	}
-
-	if (new_node != NULL) {
-		new_node->timestamp = timestamp;
-		new_node->count = 0;
-		return new_node;
-	}
-
-	/* Create a new node */
-	new_node = ntt_node_create(key);
-	new_node->timestamp = timestamp;
-	new_node->timestamp = 0;
-
-	ntt->items++;
-
-	/* Insert */
-	if (parent) { /* Existing parent */
-		parent->next = new_node;
-		return new_node; /* Return the locked node */
-	}
-
-	/* No existing parent; add directly to hash table */
-	ntt->tbl[hash_code] = new_node;
-	return new_node;
+static apr_status_t cleanup_mutex_block(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	apr_global_mutex_destroy(config->cache_mutex_block);
+	config->cache_mutex_block = NULL;
+	return APR_SUCCESS;
 }
 
-/* Tree destructor */
-
-int ntt_destroy(struct ntt* ntt) {
-	struct ntt_node *node, *next;
-	struct ntt_c c;
-
-	if (ntt == NULL)
-		return -1;
-
-	node = c_ntt_first(ntt, &c);
-	while (node != NULL) {
-		next = c_ntt_next(ntt, &c);
-		ntt_delete(ntt, node->key);
-		node = next;
-	}
-
-	free(ntt->tbl);
-	free(ntt);
-	ntt = (struct ntt*)NULL;
-
-	return 0;
+static apr_status_t cleanup_mutex_page(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	apr_global_mutex_destroy(config->cache_mutex_page);
+	config->cache_mutex_page = NULL;
+	return APR_SUCCESS;
 }
 
-/* Delete a single node in the tree */
+static apr_status_t cleanup_mutex_site(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	apr_global_mutex_destroy(config->cache_mutex_site);
+	config->cache_mutex_site = NULL;
+	return APR_SUCCESS;
+}
 
-int ntt_delete(struct ntt* ntt, const char* key) {
-	long hash_code;
-	struct ntt_node* parent = NULL;
-	struct ntt_node* node;
-	struct ntt_node* del_node = NULL;
+static apr_status_t cleanup_cache_block(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	config->cache_provider->destroy(config->cache_instance_block, s);
+	config->cache_instance_block = NULL;
+	return APR_SUCCESS;
+}
 
-	if (ntt == NULL)
-		return -1;
+static apr_status_t cleanup_cache_page(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	config->cache_provider->destroy(config->cache_instance_page, s);
+	config->cache_instance_page = NULL;
+	return APR_SUCCESS;
+}
 
-	hash_code = ntt_hashcode(ntt, key);
-	node = ntt->tbl[hash_code];
+static apr_status_t cleanup_cache_site(void* data) {
+	server_rec* s = data;
+	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+	config->cache_provider->destroy(config->cache_instance_site, s);
+	config->cache_instance_site = NULL;
+	return APR_SUCCESS;
+}
 
-	while (node != NULL) {
-		if (strcmp(key, node->key) == 0) {
-			del_node = node;
-			node = NULL;
-		}
+static int evasive20_pre_config(apr_pool_t* pcfg, apr_pool_t* plog, apr_pool_t* ptmp) {
+	apr_status_t status;
 
-		if (del_node == NULL) {
-			parent = node;
-			node = node->next;
-		}
+	// register block mutex
+	status = ap_mutex_register(pcfg, MUTEXTYPE_BLOCK, NULL, APR_LOCK_DEFAULT, 0);
+	if (status != APR_SUCCESS) {
+		ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to register mutex (block): %s", apr_strerror(status, errorstr, sizeof errorstr));
+		return !OK;
 	}
 
-	if (del_node != NULL) {
+	// register page mutex
+	status = ap_mutex_register(pcfg, MUTEXTYPE_PAGE, NULL, APR_LOCK_DEFAULT, 0);
+	if (status != APR_SUCCESS) {
+		ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to register mutex (page): %s", apr_strerror(status, errorstr, sizeof errorstr));
+		return !OK;
+	}
 
-		if (parent) {
-			parent->next = del_node->next;
-		}
+	// register site mutex
+	status = ap_mutex_register(pcfg, MUTEXTYPE_SITE, NULL, APR_LOCK_DEFAULT, 0);
+	if (status != APR_SUCCESS) {
+		ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to register mutex (site): %s", apr_strerror(status, errorstr, sizeof errorstr));
+		return !OK;
+	}
+
+	return OK;
+}
+
+static int evasive20_post_config(apr_pool_t* pcfg, apr_pool_t* plog, apr_pool_t* ptmp, server_rec* s) {
+	for (server_rec* vhost = s; vhost; vhost = vhost->next) {
+		evasive20_config* const config = (evasive20_config*)ap_get_module_config(vhost->module_config, &evasive20_module);
+		if (!config->on)
+			continue;
+
+		// check config
+		if (config->blocking_period < config->page_interval)
+			ap_log_perror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, plog, "configured blocking period shall be longer than page interval");
+		if (config->blocking_period < config->site_interval)
+			ap_log_perror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, plog, "configured blocking period shall be longer than site interval");
+		if (!config->cache_provider)
+			ap_log_perror(APLOG_MARK, APLOG_NOTICE, APR_SUCCESS, plog, "configured cache provider not found");
 		else {
-			ntt->tbl[hash_code] = del_node->next;
-		}
+			apr_status_t status;
 
-		free(del_node->key);
-		free(del_node);
-		ntt->items--;
-
-		return 0;
-	}
-
-	return -5;
-}
-
-/* Point cursor to first item in tree */
-
-struct ntt_node* c_ntt_first(struct ntt* ntt, struct ntt_c* c) {
-
-	c->iter_index = 0;
-	c->iter_next = (struct ntt_node*)NULL;
-	return (c_ntt_next(ntt, c));
-}
-
-/* Point cursor to next iteration in tree */
-
-struct ntt_node* c_ntt_next(struct ntt* ntt, struct ntt_c* c) {
-	long index;
-	struct ntt_node* node = c->iter_next;
-
-	if (ntt == NULL)
-		return NULL;
-
-	if (node) {
-		if (node != NULL) {
-			c->iter_next = node->next;
-			return (node);
-		}
-	}
-
-	if (!node) {
-		while (c->iter_index < ntt->size) {
-			index = c->iter_index++;
-
-			if (ntt->tbl[index]) {
-				c->iter_next = ntt->tbl[index]->next;
-				return (ntt->tbl[index]);
+			// instantiate block cache
+			status = ap_global_mutex_create(&config->cache_mutex_block, NULL, MUTEXTYPE_BLOCK, NULL, vhost, pcfg, 0);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to create mutex (block): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
 			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_mutex_block, apr_pool_cleanup_null);
+			status = config->cache_provider->init(config->cache_instance_block, MUTEXTYPE_BLOCK, NULL, vhost, pcfg);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to initialize cache (block): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
+			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_cache_block, apr_pool_cleanup_null);
+
+			// instantiate page cache
+			status = ap_global_mutex_create(&config->cache_mutex_page, NULL, MUTEXTYPE_PAGE, NULL, vhost, pcfg, 0);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to create mutex (page): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
+			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_mutex_page, apr_pool_cleanup_null);
+			status = config->cache_provider->init(config->cache_instance_page, MUTEXTYPE_PAGE, NULL, vhost, pcfg);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to initialize cache (page): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
+			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_cache_page, apr_pool_cleanup_null);
+
+			// instantiate site cache
+			status = ap_global_mutex_create(&config->cache_mutex_site, NULL, MUTEXTYPE_SITE, NULL, vhost, pcfg, 0);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to create mutex (site): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
+			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_mutex_site, apr_pool_cleanup_null);
+			status = config->cache_provider->init(config->cache_instance_site, MUTEXTYPE_SITE, NULL, vhost, pcfg);
+			if (status != APR_SUCCESS) {
+				ap_log_perror(APLOG_MARK, APLOG_CRIT, status, plog, "failed to initialize cache (site): %s", apr_strerror(status, errorstr, sizeof errorstr));
+				return !OK;
+			}
+			apr_pool_cleanup_register(pcfg, (void*)vhost, cleanup_cache_site, apr_pool_cleanup_null);
 		}
 	}
-	return ((struct ntt_node*)NULL);
+	return OK;
 }
 
-static const char* set_hash_table_size(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.hash_table_size = n;
-	return NULL;
+static void* create_server_config(apr_pool_t* p, server_rec* s) {
+	evasive20_config* const config = apr_pcalloc(p, sizeof(evasive20_config));
+	if (config) {
+		// set default values
+		config->on = 0;  // false
+		config->page_count = 2;
+		config->site_count = 50;
+		config->page_interval = apr_time_from_sec(1);
+		config->site_interval = apr_time_from_sec(1);
+		config->blocking_period = apr_time_from_sec(10);
+		config->whitelist_num = 0;
+
+		// set these after the entire configuration has been read
+		config->cache_mutex_block = config->cache_mutex_page = config->cache_mutex_site = NULL;
+		config->cache_instance_block = config->cache_instance_page = config->cache_instance_site = NULL;
+		config->cache_provider = NULL;
+	}
+	else
+		ap_log_error(APLOG_MARK, APLOG_CRIT, apr_get_os_error(), s, "failed to allocate memory for configuration");
+	return config;
 }
 
 static const char* set_page_count(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.page_count = n;
-	return NULL;
+	unsigned int n;
+	const apr_status_t status = apr_cstr_atoui(&n, value);
+	if (status == APR_SUCCESS) {
+		evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+		mconfig->page_count = n;
+		return NULL;
+	}
+	return apr_strerror(status, errorstr, sizeof errorstr);
 }
 
 static const char* set_site_count(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.site_count = n;
-	return NULL;
+	unsigned int n;
+	const apr_status_t status = apr_cstr_atoui(&n, value);
+	if (status == APR_SUCCESS) {
+		evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+		mconfig->site_count = n;
+		return NULL;
+	}
+	return apr_strerror(status, errorstr, sizeof errorstr);
 }
 
 static const char* set_page_interval(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.page_interval = n;
-	return NULL;
+	unsigned int n;
+	const apr_status_t status = apr_cstr_atoui(&n, value);
+	if (status == APR_SUCCESS) {
+		evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+		mconfig->page_interval = apr_time_from_sec(n);
+		return NULL;
+	}
+	return apr_strerror(status, errorstr, sizeof errorstr);
 }
 
 static const char* set_site_interval(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.site_interval = n;
-	return NULL;
+	unsigned int n;
+	const apr_status_t status = apr_cstr_atoui(&n, value);
+	if (status == APR_SUCCESS) {
+		evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+		mconfig->site_interval = apr_time_from_sec(n);
+		return NULL;
+	}
+	return apr_strerror(status, errorstr, sizeof errorstr);
 }
 
 static const char* set_blocking_period(cmd_parms* cmd, void* dconfig, const char* value) {
-	const long n = strtol(value, NULL, 0);
-	if (n > 0)
-		config.blocking_period = n;
-	return NULL;
+	unsigned int n;
+	const apr_status_t status = apr_cstr_atoui(&n, value);
+	if (status == APR_SUCCESS) {
+		evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+		mconfig->blocking_period = apr_time_from_sec(n);
+		return NULL;
+	}
+	return apr_strerror(status, errorstr, sizeof errorstr);
 }
 
 static const char* set_whitelist(cmd_parms* cmd, void* dconfig, const char* value) {
-	char entry[128];
-	snprintf(entry, sizeof entry, "WHITELIST_%s", value);
-	ntt_insert(hit_list, entry, time(NULL));
+	evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+	if (mconfig->whitelist_num < WHITELIST_NUM_MAX)
+		snprintf(mconfig->whitelist_ip[mconfig->whitelist_num++], WHITELIST_IP_SIZE, "%s", value);
+	return NULL;
+}
+
+static const char* set_cache(cmd_parms* cmd, void* dconfig, const char* value) {
+	// value has the form provider-name[:provider-args]
+	const char* name;
+	const char* args = ap_strchr_c(value, ':');
+	if (args) {
+		name = apr_pstrmemdup(cmd->pool, value, args - value);
+		args++;
+	}
+	else
+		name = value;
+
+	evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+	mconfig->cache_provider = ap_lookup_provider(AP_SOCACHE_PROVIDER_GROUP, name, AP_SOCACHE_PROVIDER_VERSION);
+	if (mconfig->cache_provider) {
+		const char* err;
+
+		// create block cache
+		if ((err = mconfig->cache_provider->create(&mconfig->cache_instance_block, args, cmd->temp_pool, cmd->pool)))
+			return apr_psprintf(cmd->pool, "failed to create cache (block): %s", err);
+
+		// create page cache
+		if ((err = mconfig->cache_provider->create(&mconfig->cache_instance_page, args, cmd->temp_pool, cmd->pool)))
+			return apr_psprintf(cmd->pool, "failed to create cache (page): %s", err);
+
+		// create site cache
+		if ((err = mconfig->cache_provider->create(&mconfig->cache_instance_site, args, cmd->temp_pool, cmd->pool)))
+			return apr_psprintf(cmd->pool, "failed to create cache (site): %s", err);
+	}
+	else
+		return apr_psprintf(cmd->pool, "failed to lookup cache provider: %s", name);
+	return NULL;
+}
+
+static const char* set_engine(cmd_parms* cmd, void* dconfig, int value) {
+	evasive20_config* const mconfig = (evasive20_config*)ap_get_module_config(cmd->server->module_config, &evasive20_module);
+	mconfig->on = value;
 	return NULL;
 }
 
 // clang-format off
 static const command_rec evasive20_cmds[] = {
-	AP_INIT_TAKE1("DOSHashTableSize", set_hash_table_size, NULL, RSRC_CONF, "Set size of hash table"),
+	AP_INIT_FLAG("DOSEngine", set_engine, NULL, RSRC_CONF, "Switch on the functionality within the given context"),
 	AP_INIT_TAKE1("DOSPageCount", set_page_count, NULL, RSRC_CONF, "Set maximum page hit count per interval"),
 	AP_INIT_TAKE1("DOSSiteCount", set_site_count, NULL, RSRC_CONF, "Set maximum site hit count per interval"),
 	AP_INIT_TAKE1("DOSPageInterval", set_page_interval, NULL, RSRC_CONF, "Set page interval in seconds"),
 	AP_INIT_TAKE1("DOSSiteInterval", set_site_interval, NULL, RSRC_CONF, "Set site interval in seconds"),
 	AP_INIT_TAKE1("DOSBlockingPeriod", set_blocking_period, NULL, RSRC_CONF, "Set blocking period in seconds for detected IPs"),
 	AP_INIT_ITERATE("DOSWhitelist", set_whitelist, NULL, RSRC_CONF, "Set IPs to be ignored, also as wildcards"),
+	AP_INIT_TAKE1("DOSCache", set_cache, NULL, RSRC_CONF, "Set cache provider"),
 	{ NULL }
 };
 // clang-format on
 
 static void register_hooks(apr_pool_t* p) {
-	config.hash_table_size = DEFAULT_HASH_TABLE_SIZE;
-	config.page_count = DEFAULT_PAGE_COUNT;
-	config.site_count = DEFAULT_SITE_COUNT;
-	config.page_interval = DEFAULT_PAGE_INTERVAL;
-	config.site_interval = DEFAULT_SITE_INTERVAL;
-	config.blocking_period = DEFAULT_BLOCKING_PERIOD;
-	ap_hook_access_checker(access_checker, NULL, NULL, APR_HOOK_FIRST);
-	apr_pool_cleanup_register(p, NULL, apr_pool_cleanup_null, destroy_hit_list);
+	ap_hook_pre_config(evasive20_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_post_config(evasive20_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+	ap_hook_access_checker(evasive20_access_checker, NULL, NULL, APR_HOOK_FIRST);
 };
 
 // clang-format off
-module AP_MODULE_DECLARE_DATA evasive20_module = {
+AP_DECLARE_MODULE(evasive20) = {
 	STANDARD20_MODULE_STUFF,
 	NULL,
 	NULL,
-	create_hit_list,
+	create_server_config,
 	NULL,
 	evasive20_cmds,
 	register_hooks
