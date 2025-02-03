@@ -30,13 +30,11 @@ global cache, and denying clients from any of the following:
 
 HOW TO INSTALL
 
-1. Extract this archive
+1. make
 
-2. Run $APACHE_ROOT/bin/apxs -i -a -c mod_evasive20.c
+2. sudo make install
 
-3. The module will be built and installed into $APACHE_ROOT/modules, and loaded into your httpd.conf
-
-4. Restart Apache
+3. sudo systemctl restart apache2  # on Debian and derivatives
 
 CONFIGURATION
 
