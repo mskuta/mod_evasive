@@ -233,6 +233,9 @@ static int evasive20_access_checker(request_rec* r) {
 static apr_status_t cleanup_mutex_block(void* data) {
 	server_rec* s = data;
 	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+
+	if (config->cache_mutex_block == NULL)
+		return APR_SUCCESS;
 	apr_global_mutex_destroy(config->cache_mutex_block);
 	config->cache_mutex_block = NULL;
 	return APR_SUCCESS;
@@ -241,6 +244,9 @@ static apr_status_t cleanup_mutex_block(void* data) {
 static apr_status_t cleanup_mutex_page(void* data) {
 	server_rec* s = data;
 	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+
+	if (config->cache_mutex_page == NULL)
+		return APR_SUCCESS;
 	apr_global_mutex_destroy(config->cache_mutex_page);
 	config->cache_mutex_page = NULL;
 	return APR_SUCCESS;
@@ -249,6 +255,9 @@ static apr_status_t cleanup_mutex_page(void* data) {
 static apr_status_t cleanup_mutex_site(void* data) {
 	server_rec* s = data;
 	evasive20_config* const config = (evasive20_config*)ap_get_module_config(s->module_config, &evasive20_module);
+
+	if (config->cache_mutex_site == NULL)
+		return APR_SUCCESS;
 	apr_global_mutex_destroy(config->cache_mutex_site);
 	config->cache_mutex_site = NULL;
 	return APR_SUCCESS;
